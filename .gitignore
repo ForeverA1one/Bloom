@@ -1,0 +1,15 @@
+# Сборка PyInstaller
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Инструменты
+.vscode/
+.idea/
+*.log
