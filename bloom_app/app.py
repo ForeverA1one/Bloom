@@ -153,8 +153,26 @@ class BloomApp:
             pass
         native.style_window(hwnd)
 
+        # Скруглённые углы применяем только после того, как окно получило
+        # реальный размер: иначе region обрежет окно по старому размеру.
+        self._rounded_size = (0, 0)
+        self.root.after(80, self._apply_rounded_corners)
+        self.root.bind("<Configure>", self._on_configure)
+
         # без этого окно не реагирует на Alt+F4 и закрытие через панель задач
         self.root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _on_configure(self, event) -> None:
+        if event.widget is self.root:
+            self._apply_rounded_corners()
+
+    def _apply_rounded_corners(self) -> None:
+        hwnd = int(self.root.frame(), 16)
+        size = (self.root.winfo_width(), self.root.winfo_height())
+        if size[0] <= 1 or size[1] <= 1 or size == self._rounded_size:
+            return
+        self._rounded_size = size
+        native.set_rounded_corners(hwnd, 14)
 
     def _apply_geometry(self, width: int) -> None:
         """Ставит окно по центру основного монитора."""
@@ -193,8 +211,8 @@ class BloomApp:
         self._build_footer(content)
 
     def _build_header(self, parent: tk.Frame) -> None:
-        header = tk.Frame(parent, bg=theme.BG, height=22)
-        header.pack(fill="x", pady=(10, 0))
+        header = tk.Frame(parent, bg=theme.BG, height=24)
+        header.pack(fill="x", pady=(4, 0))
         header.pack_propagate(False)
 
         # название по центру — как в Discord

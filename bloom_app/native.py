@@ -235,6 +235,13 @@ gdi32.SetStretchBltMode.argtypes = [HDC, ctypes.c_int]
 gdi32.SetStretchBltMode.restype = ctypes.c_int
 gdi32.SetBrushOrgEx.argtypes = [HDC, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
 gdi32.SetBrushOrgEx.restype = BOOL
+gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, ctypes.c_int]
+gdi32.CreateRoundRectRgn.restype = ctypes.c_void_p
+user32.GetWindowRect.argtypes = [HWND, ctypes.POINTER(wt.RECT)]
+user32.GetWindowRect.restype = BOOL
+user32.SetWindowRgn.argtypes = [HWND, ctypes.c_void_p, BOOL]
+user32.SetWindowRgn.restype = ctypes.c_int
 gdi32.GetDIBits.argtypes = [HDC, HANDLE, UINT, UINT, ctypes.c_void_p, ctypes.c_void_p, DWORD]
 gdi32.GetDIBits.restype = BOOL
 gdi32.DeleteObject.argtypes = [HANDLE]
@@ -841,6 +848,26 @@ def style_window(hwnd: int) -> None:
         dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))
     except Exception:
         pass
+
+
+def set_rounded_corners(hwnd: int, radius: int = 14) -> None:
+    """
+    Скругляет углы frameless-окна.
+
+    DWM не округляет окна без системной рамки, поэтому region задаётся вручную.
+    После SetWindowRgn область переходит под управление системы — удалять её
+    не нужно.
+    """
+    rect = wt.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return
+    width = rect.right - rect.left
+    height = rect.bottom - rect.top
+    if width <= 0 or height <= 0:
+        return
+    region = gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
+    if region:
+        user32.SetWindowRgn(hwnd, region, True)
 
 
 def set_process_dpi_for_tk() -> None:

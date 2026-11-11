@@ -7,10 +7,100 @@
 
 from __future__ import annotations
 
+import base64
 import math
+import struct
 import tkinter as tk
+import zlib
 
 from . import theme
+
+
+def _png_rgba(width: int, height: int, pixels: bytes) -> bytes:
+    """Собирает PNG из RGBA-буфера (строки без фильтра)."""
+    stride = width * 4
+    raw = b"".join(b"\x00" + pixels[y * stride:(y + 1) * stride] for y in range(height))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9))
+            + chunk(b"IEND", b""))
+
+
+def _coverage(dx: float, dy: float, radius: float) -> int:
+    """Сглаженное покрытие пикселя у скруглённого угла (0..255)."""
+    if radius <= 0:
+        return 255
+    dist = math.hypot(dx, dy)
+    if dist <= radius - 1:
+        return 255
+    if dist >= radius:
+        return 0
+    return max(0, min(255, int(round(255 * (radius - dist + 0.5)))))
+
+
+def make_gradient(width: int, height: int, c1, c2) -> bytes:
+    """PNG горизонтального градиента со скруглёнными концами."""
+    width = max(2, width)
+    radius = height / 2.0
+    data = bytearray()
+    for y in range(height):
+        dy = 0.0
+        if y < radius:
+            dy = radius - y
+        elif y > height - 1 - radius:
+            dy = y - (height - 1 - radius)
+        for x in range(width):
+            dx = 0.0
+            if x < radius:
+                dx = radius - x
+            elif x > width - 1 - radius:
+                dx = x - (width - 1 - radius)
+            alpha = 255 if (dx <= 0 or dy <= 0) else _coverage(dx, dy, radius)
+            t = x / max(1, width - 1)
+            data += bytes((
+                int(c1[0] + (c2[0] - c1[0]) * t),
+                int(c1[1] + (c2[1] - c1[1]) * t),
+                int(c1[2] + (c2[2] - c1[2]) * t),
+                alpha,
+            ))
+    return _png_rgba(width, height, bytes(data))
+
+
+def make_thumb(size: int, core, ring, glow) -> bytes:
+    """PNG круглого бегунка: белое ядро, цветное кольцо и мягкое свечение."""
+    size = max(8, size)
+    center = (size - 1) / 2.0
+    core_r = size * 0.34
+    ring_r = size * 0.44
+    data = bytearray()
+    for y in range(size):
+        for x in range(size):
+            dist = math.hypot(x - center, y - center)
+            if dist <= core_r - 0.5:
+                data += bytes((core[0], core[1], core[2], 255))
+            elif dist <= ring_r:
+                edge = min(1.0, (dist - (core_r - 0.5)) / 1.5)
+                data += bytes((
+                    int(core[0] + (ring[0] - core[0]) * edge),
+                    int(core[1] + (ring[1] - core[1]) * edge),
+                    int(core[2] + (ring[2] - core[2]) * edge), 255))
+            elif dist <= size / 2.0:
+                fade = 1.0 - (dist - ring_r) / max(0.5, size / 2.0 - ring_r)
+                alpha = int(round(70 * fade * fade))
+                data += bytes((glow[0], glow[1], glow[2], alpha))
+            else:
+                data += bytes((0, 0, 0, 0))
+    return _png_rgba(size, size, bytes(data))
+
+
+def photo_from_png(master, png: bytes) -> tk.PhotoImage:
+    """Создаёт PhotoImage из PNG-байтов."""
+    return tk.PhotoImage(master=master, data=base64.b64encode(png).decode("ascii"))
 
 
 def rounded_points(x1: float, y1: float, x2: float, y2: float, r: float,
@@ -214,6 +304,9 @@ class Slider(tk.Canvas):
     """
     Горизонтальный слайдер: дорожка с градиентной заливкой и «свечением»
     под бегунком. Перетаскивание мышью и управление стрелками.
+
+    Заливка и бегунок рисуются готовыми PNG: примитивы Canvas не сглаживаются
+    и выглядят «пиксельными».
     """
 
     def __init__(self, master, value=100, minimum=0, maximum=100, command=None,
@@ -228,6 +321,8 @@ class Slider(tk.Canvas):
         self._radius = radius
         self._dragging = False
         self._hover = False
+        self._grad_cache: dict[int, tk.PhotoImage] = {}
+        self._thumb_cache: dict[int, tk.PhotoImage] = {}
 
         self.bind("<Configure>", lambda e: self._redraw())
         self.bind("<Button-1>", self._on_press)
@@ -293,6 +388,24 @@ class Slider(tk.Canvas):
         self._dragging = False
 
     # -------------------------------------------------------------- отрисовка
+    def _gradient(self, width: int, height: int) -> tk.PhotoImage:
+        image = self._grad_cache.get(width)
+        if image is None:
+            image = photo_from_png(self, make_gradient(
+                width, height, hex_to_rgb(theme.ACCENT), hex_to_rgb(theme.ACCENT_2)))
+            self._grad_cache[width] = image
+        return image
+
+    def _thumb(self, size: int) -> tk.PhotoImage:
+        image = self._thumb_cache.get(size)
+        if image is None:
+            image = photo_from_png(self, make_thumb(
+                size, (255, 255, 255),
+                hex_to_rgb(theme.ACCENT_2),
+                hex_to_rgb(theme.ACCENT)))
+            self._thumb_cache[size] = image
+        return image
+
     def _redraw(self) -> None:
         self.delete("all")
         w = self.winfo_width() or 1
@@ -302,32 +415,21 @@ class Slider(tk.Canvas):
         cy = h / 2
         x1, x2 = pad, w - pad
 
+        # дорожка
         round_rect(self, x1, cy - track_h / 2, x2, cy + track_h / 2, track_h / 2,
                    fill=theme.TRACK, outline="")
 
         span = max(1, x2 - x1)
         filled = int(span * (self._value - self._min) / max(1, (self._max - self._min)))
-        if filled > 0:
-            # градиентная заливка
-            steps = max(1, filled)
-            for i in range(steps):
-                t0 = i / steps
-                t1 = (i + 1) / steps
-                color = blend(theme.ACCENT, theme.ACCENT_2, t0)
-                self.create_line(x1 + filled * t0, cy, x1 + filled * t1, cy,
-                                 fill=color, width=track_h, capstyle="round")
-            round_rect(self, x1, cy - track_h / 2, x1 + filled, cy + track_h / 2,
-                       track_h / 2, fill="", outline="", width=0)
+
+        # заливка градиентом со скруглёнными концами
+        if filled > 2:
+            self.create_image(x1, cy, image=self._gradient(filled, track_h), anchor="w")
 
         # бегунок
         thumb_x = x1 + filled
-        radius = 11 if (self._hover or self._dragging) else 9
-        if self._hover or self._dragging:
-            self.create_oval(thumb_x - radius - 5, cy - radius - 5,
-                             thumb_x + radius + 5, cy + radius + 5,
-                             fill=blend(self._bg, theme.ACCENT, 0.22), outline="")
-        self.create_oval(thumb_x - radius, cy - radius, thumb_x + radius, cy + radius,
-                         fill="#FFFFFF", outline=theme.ACCENT_2, width=2)
+        size = 28 if (self._hover or self._dragging) else 24
+        self.create_image(thumb_x, cy, image=self._thumb(size))
 
 
 class ValueReadout(tk.Canvas):
