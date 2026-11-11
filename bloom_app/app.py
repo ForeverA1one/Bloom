@@ -277,8 +277,20 @@ class BloomApp:
 
     # ------------------------------------------------------------- превью
     def _start_preview_worker(self) -> None:
+        """
+        Живое превью.
+
+        Частота кадров подстраивается сама: после каждого цикла измеряется
+        затраченное время и пауза подбирается так, чтобы съёмка занимала
+        примерно пятую часть процессорного времени. На быстром компьютере
+        выходит около 8-10 кадров в секунду, на слабом — меньше, но интерфейс
+        не будет подтормаживать.
+        """
+        grabbers: dict[int, native.ScreenGrabber] = {}
+
         def worker():
             while not self._closing:
+                cycle_start = time.perf_counter()
                 for monitor in list(self.engine.monitors):
                     if self._closing:
                         break
@@ -287,19 +299,26 @@ class BloomApp:
                     height = max(100, int(width * monitor.height / max(1, monitor.width)))
                     # превью показывает, насколько ярким будет выглядеть экран
                     dim = 100 - level
+                    png = None
                     try:
                         if self.demo:
                             from . import demo
                             png = demo.render_preview(monitor.index, width, height,
                                                       dim=dim, phase=time.monotonic())
                         else:
-                            png = native.capture_screen(monitor.rect, width, height,
-                                                        dim=dim, radius=14)
+                            grabber = grabbers.get(monitor.index)
+                            if grabber is None:
+                                grabber = native.ScreenGrabber(monitor.rect)
+                                grabbers[monitor.index] = grabber
+                            png = grabber.grab(width, height, dim=dim, radius=14)
                     except Exception:
                         png = None
                     if png:
                         self._preview_queue.put((monitor.index, png))
-                self._stop_preview.wait(0.12 if self.demo else 1.6)
+
+                cycle = time.perf_counter() - cycle_start
+                pause = max(0.09, min(1.5, cycle * 4))
+                self._stop_preview.wait(pause)
 
         self._stop_preview = threading.Event()
         threading.Thread(target=worker, daemon=True, name="bloom-preview").start()

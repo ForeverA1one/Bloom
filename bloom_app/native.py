@@ -637,130 +637,180 @@ class OverlayDimmer:
 def capture_screen(rect: tuple[int, int, int, int], out_w: int, out_h: int,
                    dim: int = 0, radius: int = 0) -> bytes | None:
     """
-    Снимает область экрана и возвращает PNG-байты размером out_w x out_h.
+    Разовый захват области экрана (PNG-байты).
 
-    dim (0..100) применяется к яркости прямо в пикселях — превью в
-    интерфейсе показывает результат затемнения «как есть».
-    radius скругляет углы прозрачной маской.
+    Для поточного использования лучше ScreenGrabber — он переиспользует
+    ресурсы GDI между кадрами.
     """
-    x, y, r, b = rect
-    w, h = r - x, b - y
-    if w <= 0 or h <= 0:
-        return None
+    grabber = ScreenGrabber(rect)
+    try:
+        return grabber.grab(out_w, out_h, dim=dim, radius=radius)
+    finally:
+        grabber.close()
 
-    screen_dc = user32.GetDC(None)
-    if not screen_dc:
-        return None
 
-    # Шаг 1: копируем область на экранной DC.
-    # Именно BitBlt, а не StretchBlt: он корректно работает с областями,
-    # лежащими левее/выше начала координат виртуального экрана.
-    # Битмапы создаём от экранной DC — у DC памяти формат по умолчанию
-    # одноцветный, и цветное изображение в него не скопировать.
-    src_dc = gdi32.CreateCompatibleDC(screen_dc)
-    src_bmp = gdi32.CreateCompatibleBitmap(screen_dc, w, h)
-    old_src = gdi32.SelectObject(src_dc, src_bmp)
-    gdi32.BitBlt(src_dc, 0, 0, w, h, screen_dc, x, y, SRCCOPY | CAPTUREBLT)
+class ScreenGrabber:
+    """
+    Живой захват области экрана с переиспользованием ресурсов GDI.
 
-    # Шаг 2: масштабируем в превью.
-    mem_dc = gdi32.CreateCompatibleDC(screen_dc)
-    bitmap = gdi32.CreateCompatibleBitmap(screen_dc, out_w, out_h)
-    if not bitmap:
-        gdi32.SelectObject(src_dc, old_src)
-        gdi32.DeleteObject(src_bmp)
-        gdi32.DeleteDC(src_dc)
-        gdi32.DeleteDC(mem_dc)
-        user32.ReleaseDC(None, screen_dc)
-        return None
+    Создаётся один раз на монитор: создание и удаление битмапов при каждом
+    кадре съедало бы половину времени съёмки.
+    """
 
-    old = gdi32.SelectObject(mem_dc, bitmap)
-    gdi32.SetStretchBltMode(mem_dc, HALFTONE)
-    # для HALFTONE обязателен сдвиг кисти, иначе режим не применяется
-    gdi32.SetBrushOrgEx(mem_dc, 0, 0, None)
-    gdi32.StretchBlt(mem_dc, 0, 0, out_w, out_h, src_dc, 0, 0, w, h, SRCCOPY)
+    def __init__(self, rect: tuple[int, int, int, int]):
+        self.rect = rect
+        self._src_dc = None
+        self._src_bmp = None
+        self._mem_dc = None
+        self._bmp = None
+        self._old = None
+        self._w = 0
+        self._h = 0
 
-    bi = BITMAPINFO()
-    bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bi.bmiHeader.biWidth = out_w
-    bi.bmiHeader.biHeight = -out_h
-    bi.bmiHeader.biPlanes = 1
-    bi.bmiHeader.biBitCount = 32
-    bi.bmiHeader.biCompression = 0
-    buf = ctypes.create_string_buffer(out_w * out_h * 4)
-    ok = gdi32.GetDIBits(mem_dc, bitmap, 0, out_h, buf, ctypes.byref(bi), 0)
+    def close(self) -> None:
+        if self._mem_dc is not None:
+            try:
+                gdi32.SelectObject(self._mem_dc, self._old)
+                gdi32.DeleteObject(self._bmp)
+                gdi32.DeleteDC(self._mem_dc)
+            except Exception:
+                pass
+            self._mem_dc = None
+            self._bmp = None
+        if self._src_dc is not None:
+            try:
+                gdi32.SelectObject(self._src_dc, self._src_old)
+                gdi32.DeleteObject(self._src_bmp)
+                gdi32.DeleteDC(self._src_dc)
+            except Exception:
+                pass
+            self._src_dc = None
+            self._src_bmp = None
 
-    gdi32.SelectObject(mem_dc, old)
-    gdi32.DeleteObject(bitmap)
-    gdi32.DeleteDC(mem_dc)
-    gdi32.SelectObject(src_dc, old_src)
-    gdi32.DeleteObject(src_bmp)
-    gdi32.DeleteDC(src_dc)
-    user32.ReleaseDC(None, screen_dc)
+    def grab(self, out_w: int, out_h: int, dim: int = 0, radius: int = 0) -> bytes | None:
+        x, y, right, bottom = self.rect
+        sw, sh = right - x, bottom - y
+        if sw <= 0 or sh <= 0:
+            return None
 
-    if not ok:
-        return None
-    return _bgra_to_png(buf.raw, out_w, out_h, dim, radius)
+        screen_dc = user32.GetDC(None)
+        if not screen_dc:
+            return None
+        try:
+            if self._src_dc is None:
+                self._src_dc = gdi32.CreateCompatibleDC(screen_dc)
+                self._src_bmp = gdi32.CreateCompatibleBitmap(screen_dc, sw, sh)
+                self._src_old = gdi32.SelectObject(self._src_dc, self._src_bmp)
+
+            # Копируем область на экранной DC. Именно BitBlt, а не StretchBlt:
+            # он корректно работает с областями левее/выше начала координат
+            # виртуального экрана. CAPTUREBLT включает и наложенные окна.
+            gdi32.BitBlt(self._src_dc, 0, 0, sw, sh, screen_dc, x, y,
+                         SRCCOPY | CAPTUREBLT)
+
+            if self._mem_dc is None or self._w != out_w or self._h != out_h:
+                if self._mem_dc is not None:
+                    gdi32.SelectObject(self._mem_dc, self._old)
+                    gdi32.DeleteObject(self._bmp)
+                    gdi32.DeleteDC(self._mem_dc)
+                self._mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+                self._bmp = gdi32.CreateCompatibleBitmap(screen_dc, out_w, out_h)
+                self._old = gdi32.SelectObject(self._mem_dc, self._bmp)
+                self._w, self._h = out_w, out_h
+
+            gdi32.SetStretchBltMode(self._mem_dc, HALFTONE)
+            gdi32.SetBrushOrgEx(self._mem_dc, 0, 0, None)
+            gdi32.StretchBlt(self._mem_dc, 0, 0, out_w, out_h,
+                             self._src_dc, 0, 0, sw, sh, SRCCOPY)
+
+            bi = BITMAPINFO()
+            bi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bi.bmiHeader.biWidth = out_w
+            bi.bmiHeader.biHeight = -out_h
+            bi.bmiHeader.biPlanes = 1
+            bi.bmiHeader.biBitCount = 32
+            bi.bmiHeader.biCompression = 0
+            buf = ctypes.create_string_buffer(out_w * out_h * 4)
+            if not gdi32.GetDIBits(self._mem_dc, self._bmp, 0, out_h,
+                                   buf, ctypes.byref(bi), 0):
+                return None
+            raw = buf.raw
+        finally:
+            user32.ReleaseDC(None, screen_dc)
+
+        return _bgra_to_png(raw, out_w, out_h, dim, radius)
 
 
 def _bgra_to_png(raw: bytes, width: int, height: int, dim: int, radius: int = 0) -> bytes:
-    """Конвертирует BGRA-буфер в PNG (RGBA), затемняя пиксели на dim процентов."""
+    """
+    Конвертирует BGRA-буфер в PNG (RGBA), затемняя пиксели на dim процентов.
+
+    Перебор пикселей на Python занимал ~20 мс на кадр — здесь используются
+    срезы и таблицы перевода, вся операция занимает около миллисекунды.
+    """
     import struct
     import zlib
 
     factor = 1.0 - max(0, min(100, dim)) / 100.0
-    rows = []
-    stride = width * 4
-    for y in range(height):
-        base = y * stride
-        row = bytearray()
-        row.append(0)  # PNG filter type 0
-        for x in range(width):
-            i = base + x * 4
-            b, g, r = raw[i], raw[i + 1], raw[i + 2]
-            if factor < 1.0:
-                r = int(r * factor)
-                g = int(g * factor)
-                b = int(b * factor)
-            if radius > 0:
-                alpha = _corner_alpha(x, y, width, height, radius)
-            else:
-                alpha = 255
-            row += bytes((r, g, b, alpha))
-        rows.append(bytes(row))
+    if factor < 1.0:
+        table = bytes(int(i * factor) for i in range(256))
+        red = raw[2::4].translate(table)
+        green = raw[1::4].translate(table)
+        blue = raw[0::4].translate(table)
+    else:
+        red = raw[2::4]
+        green = raw[1::4]
+        blue = raw[0::4]
+
+    count = width * height
+    pixels = bytearray(count * 4)
+    pixels[0::4] = red
+    pixels[1::4] = green
+    pixels[2::4] = blue
+    pixels[3::4] = b"\xff" * count
+
+    if radius > 0:
+        # скруглённые углы: правим только угловые пиксели
+        pixels = _round_corners(pixels, width, height, radius)
 
     def chunk(tag: bytes, data: bytes) -> bytes:
         return (struct.pack(">I", len(data)) + tag + data
                 + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
 
-    payload = zlib.compress(b"".join(rows), 6)
+    # каждая строка PNG начинается с байта фильтра (0 — без фильтра)
+    stride = width * 4
+    scanlines = b"".join(
+        b"\x00" + bytes(pixels[y * stride:(y + 1) * stride]) for y in range(height)
+    )
+    payload = zlib.compress(scanlines, 1)
     return (b"\x89PNG\r\n\x1a\n"
             + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
             + chunk(b"IDAT", payload)
             + chunk(b"IEND", b""))
 
 
-def _corner_alpha(x: int, y: int, width: int, height: int, radius: int) -> int:
-    """Сглаженная альфа-маска по углам (суперимпозиция со сглаживанием)."""
+def _round_corners(pixels: bytearray, width: int, height: int, radius: int) -> bytearray:
+    """Делает углы прозрачными со сглаживанием."""
     radius = min(radius, width // 2, height // 2)
     if radius <= 0:
-        return 255
-    cx = cy = None
-    if x < radius and y < radius:
-        cx, cy = radius, radius
-    elif x >= width - radius and y < radius:
-        cx, cy = width - radius - 1, radius
-    elif x < radius and y >= height - radius:
-        cx, cy = radius, height - radius - 1
-    elif x >= width - radius and y >= height - radius:
-        cx, cy = width - radius - 1, height - radius - 1
-    if cx is None:
-        return 255
-    dist = math.hypot(x - cx, y - cy)
-    if dist <= radius - 1:
-        return 255
-    if dist >= radius:
-        return 0
-    return int(round(255 * (radius - dist)))
+        return pixels
+    corners = (
+        (0, 0, radius, radius),
+        (width - radius, 0, width, radius),
+        (0, height - radius, radius, height),
+        (width - radius, height - radius, width, height),
+    )
+    for x1, y1, x2, y2 in corners:
+        cx = x1 + radius if x1 == 0 else x2 - radius - 1
+        cy = y1 + radius if y1 == 0 else y2 - radius - 1
+        for y in range(y1, y2):
+            for x in range(x1, x2):
+                dist = math.hypot(x - cx, y - cy)
+                if dist <= radius - 1:
+                    continue
+                value = 0 if dist >= radius else int(round(255 * (radius - dist)))
+                pixels[(y * width + x) * 4 + 3] = value
+    return pixels
 
 
 
