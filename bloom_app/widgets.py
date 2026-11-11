@@ -31,20 +31,13 @@ def _png_rgba(width: int, height: int, pixels: bytes) -> bytes:
             + chunk(b"IEND", b""))
 
 
-def _coverage(dx: float, dy: float, radius: float) -> int:
-    """Сглаженное покрытие пикселя у скруглённого угла (0..255)."""
-    if radius <= 0:
-        return 255
-    dist = math.hypot(dx, dy)
-    if dist <= radius - 1:
-        return 255
-    if dist >= radius:
-        return 0
-    return max(0, min(255, int(round(255 * (radius - dist + 0.5)))))
-
-
 def make_gradient(width: int, height: int, c1, c2) -> bytes:
-    """PNG горизонтального градиента со скруглёнными концами."""
+    """
+    PNG горизонтального градиента со скруглёнными концами.
+
+    Альфа жёсткая (0 или 255): мягкие полупрозрачные края при увеличении
+    превращаются в «иголки» — Tk рисует полупрозрачные пиксели сеткой.
+    """
     width = max(2, width)
     radius = height / 2.0
     data = bytearray()
@@ -60,7 +53,10 @@ def make_gradient(width: int, height: int, c1, c2) -> bytes:
                 dx = radius - x
             elif x > width - 1 - radius:
                 dx = x - (width - 1 - radius)
-            alpha = 255 if (dx <= 0 or dy <= 0) else _coverage(dx, dy, radius)
+            alpha = 255
+            if dx > 0 and dy > 0:
+                if math.hypot(dx, dy) > radius - 0.5:
+                    alpha = 0
             t = x / max(1, width - 1)
             data += bytes((
                 int(c1[0] + (c2[0] - c1[0]) * t),
@@ -69,33 +65,6 @@ def make_gradient(width: int, height: int, c1, c2) -> bytes:
                 alpha,
             ))
     return _png_rgba(width, height, bytes(data))
-
-
-def make_thumb(size: int, core, ring, glow) -> bytes:
-    """PNG круглого бегунка: белое ядро, цветное кольцо и мягкое свечение."""
-    size = max(8, size)
-    center = (size - 1) / 2.0
-    core_r = size * 0.34
-    ring_r = size * 0.44
-    data = bytearray()
-    for y in range(size):
-        for x in range(size):
-            dist = math.hypot(x - center, y - center)
-            if dist <= core_r - 0.5:
-                data += bytes((core[0], core[1], core[2], 255))
-            elif dist <= ring_r:
-                edge = min(1.0, (dist - (core_r - 0.5)) / 1.5)
-                data += bytes((
-                    int(core[0] + (ring[0] - core[0]) * edge),
-                    int(core[1] + (ring[1] - core[1]) * edge),
-                    int(core[2] + (ring[2] - core[2]) * edge), 255))
-            elif dist <= size / 2.0:
-                fade = 1.0 - (dist - ring_r) / max(0.5, size / 2.0 - ring_r)
-                alpha = int(round(70 * fade * fade))
-                data += bytes((glow[0], glow[1], glow[2], alpha))
-            else:
-                data += bytes((0, 0, 0, 0))
-    return _png_rgba(size, size, bytes(data))
 
 
 def photo_from_png(master, png: bytes) -> tk.PhotoImage:
@@ -197,20 +166,77 @@ class Card(tk.Frame):
         return frame
 
 
+class Tooltip:
+    """Подсказка, появляющаяся при наведении на виджет."""
+
+    def __init__(self, widget, text, fonts=None, delay=0.35):
+        self.widget = widget
+        self.text = text
+        self.fonts = fonts
+        self.delay = delay
+        self._after = None
+        self._window = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel()
+        self._after = self.widget.after(int(self.delay * 1000), self._show)
+
+    def _cancel(self) -> None:
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self) -> None:
+        self._cancel()
+        if self._window is not None:
+            return
+        win = tk.Toplevel(self.widget)
+        win.wm_overrideredirect(True)
+        win.configure(bg=theme.CARD_LINE)
+        tk.Label(win, text=self.text, bg=theme.CARD, fg=theme.TEXT_DIM,
+                 font=self.fonts.small if self.fonts else None,
+                 padx=10, pady=6, justify="left").pack(padx=1, pady=1)
+        win.update_idletasks()
+        width = win.winfo_width()
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2 - width // 2
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        x = max(8, min(x, self.widget.winfo_screenwidth() - width - 8))
+        win.geometry(f"+{x}+{y}")
+        self._window = win
+
+    def _hide(self, _event=None) -> None:
+        self._cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except Exception:
+                pass
+            self._window = None
+
+
 class Badge(tk.Canvas):
     """Небольшая «пилюля» с текстом — используется для указания способа."""
 
     def __init__(self, master, text="", dot_color=theme.OK, text_color=theme.TEXT_DIM,
-                 fonts=None, pad_x=10, pad_y=4, bg=theme.CARD):
+                 fonts=None, pad_x=10, pad_y=4, bg=theme.CARD, tooltip=None):
         self.fonts = fonts
         super().__init__(master, bg=bg, highlightthickness=0, bd=0,
-                         height=22, cursor="hand2")
+                         height=22)
         self._text = text
         self._dot = dot_color
         self._fg = text_color
         self._bg = bg
         self._pad_x = pad_x
         self._pad_y = pad_y
+        self._tooltip = None
+        if tooltip:
+            self._tooltip = Tooltip(self, tooltip, fonts=fonts)
         self.bind("<Configure>", lambda e: self._redraw())
 
     def set(self, text: str, dot_color=None, text_color=None) -> None:
@@ -323,7 +349,6 @@ class Slider(tk.Canvas):
         self._hover = False
         self._grad_image = None
         self._grad_width = 0
-        self._thumb_cache: dict[int, tk.PhotoImage] = {}
 
         self.bind("<Configure>", lambda e: self._redraw())
         self.bind("<Button-1>", self._on_press)
@@ -405,16 +430,6 @@ class Slider(tk.Canvas):
             self._grad_width = width
         return image
 
-    def _thumb(self, size: int) -> tk.PhotoImage:
-        image = self._thumb_cache.get(size)
-        if image is None:
-            image = photo_from_png(self, make_thumb(
-                size, (255, 255, 255),
-                hex_to_rgb(theme.ACCENT_2),
-                hex_to_rgb(theme.ACCENT)))
-            self._thumb_cache[size] = image
-        return image
-
     def _redraw(self) -> None:
         self.delete("all")
         w = self.winfo_width() or 1
@@ -438,9 +453,15 @@ class Slider(tk.Canvas):
             round_rect(self, thumb_x, cy - track_h / 2, x2, cy + track_h / 2,
                        track_h / 2, fill=theme.TRACK, outline="")
 
-        # бегунок
-        size = 28 if (self._hover or self._dragging) else 24
-        self.create_image(thumb_x, cy, image=self._thumb(size))
+        # Бегунок — два концентрических овала: получается ровный круг
+        # без полупрозрачности (она в Tk рисуется сеткой и выглядит
+        # «иголками» при увеличении).
+        radius = 12 if (self._hover or self._dragging) else 10
+        self.create_oval(thumb_x - radius, cy - radius, thumb_x + radius, cy + radius,
+                         fill=theme.ACCENT_2, outline="")
+        inner = radius - 2
+        self.create_oval(thumb_x - inner, cy - inner, thumb_x + inner, cy + inner,
+                         fill="#FFFFFF", outline="")
 
 
 class ValueReadout(tk.Canvas):
@@ -472,17 +493,19 @@ class ValueReadout(tk.Canvas):
         # иначе знак «%» наезжает на последнюю цифру
         if big:
             advance = big.measure("0")
-            value_w = advance * len(text)
+            digits_w = advance * len(text)
             pct_w = small.measure("%") if small else 10
         else:
-            value_w = len(text) * 18
+            digits_w = len(text) * 18
             pct_w = 10
-        gap = 7
-        total = value_w + gap + pct_w
-        x = max(0, (w - total) / 2)
+        gap = 6
 
+        # Центрируем именно цифры: знак «%» остаётся суффиксом справа.
+        # Если центрировать всю строку «75 %» целиком, цифры визуально
+        # уезжают влево и справа от значения кажется пустым.
+        x = max(0.0, (w - digits_w) / 2)
         self.create_text(x, h / 2, text=text, anchor="w", fill=self._color, font=big)
-        self.create_text(x + value_w + gap, h / 2 + 10, text="%", anchor="w",
+        self.create_text(x + digits_w + gap, h / 2 + 10, text="%", anchor="w",
                          fill=self._sub, font=small)
 
 

@@ -36,16 +36,22 @@ class MonitorCard(widgets.Card):
 
         body = self.body(padx=theme.PAD, pady=18)
         body.pack_propagate(False)
+        self.body_frame = body
 
         # --- заголовок ---
         head = tk.Frame(body, bg=theme.CARD)
         head.pack(fill="x")
 
         # Бейдж пакуется первым: иначе растягивающийся заголовок
-        # вытеснит его и текст обрежется.
-        self.badge = widgets.Badge(head, text=monitor.method_label, fonts=fonts,
-                                   dot_color=theme.OK if monitor.method == engine.METHOD_DDC else theme.WARN,
-                                   text_color=theme.TEXT_DIM)
+        # вытеснит его и текст обрежется. Это просто метка состояния,
+        # ничего не делает — при наведении показывается пояснение.
+        self.badge = widgets.Badge(
+            head, text=monitor.method_label, fonts=fonts,
+            dot_color=theme.OK if monitor.method == engine.METHOD_DDC else theme.WARN,
+            text_color=theme.TEXT_DIM,
+            tooltip=("DDC/CI — аппаратная яркость монитора"
+                     if monitor.method == engine.METHOD_DDC
+                     else "DDC/CI недоступен — затемнение экранным оверлеем"))
         self.badge.pack(side="right", anchor="n")
 
         title_box = tk.Frame(head, bg=theme.CARD)
@@ -67,7 +73,7 @@ class MonitorCard(widgets.Card):
         # --- значение ---
         self.value = widgets.ValueReadout(body, fonts=fonts, bg=theme.CARD)
         self.value.set(monitor.level)
-        self.value.pack(pady=(8, 0))
+        self.value.pack(fill="x", pady=(8, 0))
 
         # --- слайдер ---
         self.slider = widgets.Slider(body, value=monitor.level, fonts=fonts, bg=theme.CARD,
@@ -78,12 +84,16 @@ class MonitorCard(widgets.Card):
         presets = tk.Frame(body, bg=theme.CARD)
         presets.pack(fill="x")
 
-        for value, label in ((100, "100%"), (60, "60%"), (30, "30%"), (0, "0%")):
-            btn = widgets.FlatButton(presets, text=label, fonts=fonts, width=64, height=28,
-                                      bg=theme.CARD, fg=theme.TEXT_DIM,
+        # пять равных кнопок, симметрично по краям карточки
+        values = (100, 75, 50, 25, 0)
+        gap = 6
+        btn_w = (PREVIEW_WIDTH - gap * (len(values) - 1)) // len(values)
+        for index, value in enumerate(values):
+            btn = widgets.FlatButton(presets, text=f"{value}%", fonts=fonts, width=btn_w,
+                                      height=28, bg=theme.CARD, fg=theme.TEXT_DIM,
                                       hover_bg=theme.CARD_LINE, hover_fg=theme.TEXT,
                                       command=lambda v=value: self._preset(v))
-            btn.pack(side="left", padx=(0, 8))
+            btn.pack(side="left", padx=(0, gap if index < len(values) - 1 else 0))
 
     def _preset(self, value: int) -> None:
         self.slider.set(value, notify=True)
@@ -211,25 +221,25 @@ class BloomApp:
         self._build_footer(content)
 
     def _build_header(self, parent: tk.Frame) -> None:
-        header = tk.Frame(parent, bg=theme.BG, height=24)
+        header = tk.Frame(parent, bg=theme.BG_DEEP, height=24)
         header.pack(fill="x", pady=(4, 0))
         header.pack_propagate(False)
 
         # название по центру — как в Discord
-        center = tk.Frame(header, bg=theme.BG)
-        tk.Label(center, text=APP_TITLE, bg=theme.BG, fg=theme.TEXT,
+        center = tk.Frame(header, bg=theme.BG_DEEP)
+        tk.Label(center, text=APP_TITLE, bg=theme.BG_DEEP, fg=theme.TEXT,
                  font=self.fonts.h1).pack()
         center.place(relx=0.5, rely=0.5, anchor="center")
 
         # кнопка закрытия справа
-        close = tk.Label(header, text="✕", bg=theme.BG, fg=theme.TEXT_DIM,
+        close = tk.Label(header, text="✕", bg=theme.BG_DEEP, fg=theme.TEXT_DIM,
                          font=self.fonts.h3, cursor="hand2")
 
         def enter(_e=None):
             close.configure(bg=theme.CARD_LINE, fg=theme.TEXT)
 
         def leave(_e=None):
-            close.configure(bg=theme.BG, fg=theme.TEXT_DIM)
+            close.configure(bg=theme.BG_DEEP, fg=theme.TEXT_DIM)
 
         close.bind("<Enter>", enter)
         close.bind("<Leave>", leave)
@@ -277,17 +287,19 @@ class BloomApp:
             child.destroy()
         self.cards.clear()
 
-        for monitor in monitors:
+        # отступ только между карточками: trailing-отступ съедал бы ширину
+        # последней карточки, и она получалась бы уже остальных
+        for index, monitor in enumerate(monitors):
             card = MonitorCard(self.cards_wrap, monitor, self.fonts, self._on_card_change)
-            card.pack(side="left", padx=(0, theme.GAP))
+            card.pack(side="left", padx=(0, theme.GAP if index < len(monitors) - 1 else 0))
             self.cards.append(card)
 
         if not monitors:
             return
 
-        # ширина окна подстраивается под число мониторов
+        # ширина окна — по числу мониторов, с запасом в пару пикселей
         count = len(monitors)
-        width = 2 * theme.PAD + 12 + count * CARD_WIDTH + (count - 1) * theme.GAP
+        width = 2 * (theme.PAD + 6) + count * CARD_WIDTH + (count - 1) * theme.GAP + 2
         self._apply_geometry(min(width, 1600))
 
     def _on_card_change(self, monitor: engine.Monitor, value: int) -> None:
