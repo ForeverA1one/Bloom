@@ -321,7 +321,8 @@ class Slider(tk.Canvas):
         self._radius = radius
         self._dragging = False
         self._hover = False
-        self._grad_cache: dict[int, tk.PhotoImage] = {}
+        self._grad_image = None
+        self._grad_width = 0
         self._thumb_cache: dict[int, tk.PhotoImage] = {}
 
         self.bind("<Configure>", lambda e: self._redraw())
@@ -389,11 +390,19 @@ class Slider(tk.Canvas):
 
     # -------------------------------------------------------------- отрисовка
     def _gradient(self, width: int, height: int) -> tk.PhotoImage:
-        image = self._grad_cache.get(width)
-        if image is None:
+        """
+        Градиент на всю длину дорожки.
+
+        Важно: картинка делается ОДИН раз на ширину дорожки, а не на
+        ширину заливки — иначе при каждом пикселе движения ползунка
+        создавался бы новый PNG и PhotoImage, и приложение подтормаживало.
+        """
+        image = self._grad_image
+        if image is None or self._grad_width != width:
             image = photo_from_png(self, make_gradient(
                 width, height, hex_to_rgb(theme.ACCENT), hex_to_rgb(theme.ACCENT_2)))
-            self._grad_cache[width] = image
+            self._grad_image = image
+            self._grad_width = width
         return image
 
     def _thumb(self, size: int) -> tk.PhotoImage:
@@ -421,13 +430,15 @@ class Slider(tk.Canvas):
 
         span = max(1, x2 - x1)
         filled = int(span * (self._value - self._min) / max(1, (self._max - self._min)))
+        thumb_x = x1 + filled
 
-        # заливка градиентом со скруглёнными концами
         if filled > 2:
-            self.create_image(x1, cy, image=self._gradient(filled, track_h), anchor="w")
+            # градиент на всю дорожку, а лишняя часть закрывается дорожкой
+            self.create_image(x1, cy, image=self._gradient(span, track_h), anchor="w")
+            round_rect(self, thumb_x, cy - track_h / 2, x2, cy + track_h / 2,
+                       track_h / 2, fill=theme.TRACK, outline="")
 
         # бегунок
-        thumb_x = x1 + filled
         size = 28 if (self._hover or self._dragging) else 24
         self.create_image(thumb_x, cy, image=self._thumb(size))
 
