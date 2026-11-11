@@ -1,7 +1,7 @@
 # Bloom
 
 <p align="center">
-  <img src="docs/demo.gif" width="680" alt="Bloom — управление яркостью мониторов">
+  <img src="docs/screenshot.png" width="680" alt="Bloom — управление яркостью мониторов">
 </p>
 
 **Bloom** — небольшое нативное приложение для Windows, которое меняет яркость
